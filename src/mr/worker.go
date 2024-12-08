@@ -1,33 +1,46 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"time"
+)
 
-
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
+type tFile struct {
+	name string
+	f    *os.File
+	enc  *json.Encoder
+}
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -35,60 +48,32 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
-	for id,done := -1,false; done;id, done = CallTask(mapf, reducef, id) {}
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+	for t, id := TASK_IDLE, -1; t != TASK_DONE; t, id = CallTask(mapf, reducef, t, id) {
 	}
 }
 
-func CallTask(mapf func(string, string) []KeyValue, reducef func(string, []string) string, id int) (id int, done bool) {
-	args := TaskArgs{Id:id}
+func CallTask(mapf func(string, string) []KeyValue, reducef func(string, []string) string, t, id int) (int, int) {
+	args := TaskArgs{T: t, Id: id}
 	reply := TaskReply{}
 	ok := call("Coordinator.Task", &args, &reply)
+	if !ok {
+		log.Fatalf("RPC call failed")
+	}
 	switch reply.T {
 	case TASK_MAP:
-		doMap(mapf, reply.Id, reply.Filename)
+		doMap(mapf, reply.Id, reply.Filename, reply.NReduce)
 	case TASK_REDUCE:
 		doReduce(reducef, reply.Id)
 	case TASK_IDLE:
 		time.Sleep(1 * time.Second)
 	case TASK_DONE:
-		return -1, true
 	}
-	return reply.Id, false
+	return reply.T, reply.Id
 }
 
-//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
@@ -107,7 +92,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func doMap(mapf func(string, string) []KeyValue, id int, filename string) {
+func doMap(mapf func(string, string) []KeyValue, id int, filename string, nReduce int) {
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -123,49 +108,104 @@ func doMap(mapf func(string, string) []KeyValue, id int, filename string) {
 	if err != nil {
 		log.Fatalf("cannot getwd")
 	}
-	f, err := os.CreateTemp("", "sample")
-	enc := json.NewEncoder(file)
-	for _, kv := kva {
-	  err := enc.Encode(&kv)
+	tfs := make([]*tFile, nReduce)
+	for i := 0; i < nReduce; i += 1 {
+		name := fmt.Sprintf("mr-%v-%v", id, i)
+		f, err := os.CreateTemp(pwd, name)
+		if err != nil {
+			log.Fatalf("cannot create temp file")
+		}
+		defer f.Close()
+		enc := json.NewEncoder(f)
+		tfs[i] = &tFile{name, f, enc}
+	}
+	for _, kv := range kva {
+		i := ihash(kv.Key) % nReduce
+		err := tfs[i].enc.Encode(&kv)
+		if err != nil {
+			log.Fatalf("cannot encode kv to file")
+		}
+	}
+	for _, tf := range tfs {
+		tf.f.Close()
+		err := os.Rename(tf.f.Name(), tf.name)
+		if err != nil {
+			log.Fatalf("cannot rename file")
+		}
 	}
 }
 
 func doReduce(reducef func(string, []string) string, id int) {
-	sort.Sort(ByKey(intermediate))
-
-	oname := "mr-out-0"
-	ofile, _ := os.Create(oname)
-
-	dec := json.NewDecoder(file)
-	for {
-	  var kv KeyValue
-	  if err := dec.Decode(&kv); err != nil {
-		break
-	  }
-	  kva = append(kva, kv)
+	pwd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("cannot getwd")
 	}
 
-	//
-	// call Reduce on each distinct key in intermediate[],
-	// and print the result to mr-out-0.
-	//
+	pattern := fmt.Sprintf(`^mr-[0-9]+-%v$`, id)
+	//fmt.Println(pattern)
+	re := regexp.MustCompile(pattern)
+
+	kva := []KeyValue{}
+	err = filepath.Walk(pwd, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		//fmt.Printf("try to match %v for id %v\n", info.Name(), id)
+		if re.MatchString(info.Name()) {
+			//fmt.Printf("%v matched for id %v\n", info.Name(), id)
+			ifile, err := os.Open(info.Name())
+			if err != nil {
+				return err
+			}
+			dec := json.NewDecoder(ifile)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					break
+				}
+				kva = append(kva, kv)
+			}
+			ifile.Close()
+		}
+		return nil
+	})
+
+	if err != nil {
+		log.Fatalf("cannot read file")
+	}
+
+	sort.Sort(ByKey(kva))
+
+	oname := fmt.Sprintf("mr-out-%v", id)
+	ofile, err := os.CreateTemp(pwd, oname)
+	if err != nil {
+		log.Fatalf("cannot create temp file")
+	}
+	defer ofile.Close()
+
 	i := 0
-	for i < len(intermediate) {
+	for i < len(kva) {
 		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+		for j < len(kva) && kva[j].Key == kva[i].Key {
 			j++
 		}
 		values := []string{}
 		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
+			values = append(values, kva[k].Value)
 		}
-		output := reducef(intermediate[i].Key, values)
+		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
-
 	ofile.Close()
+	err = os.Rename(ofile.Name(), oname)
+	if err != nil {
+		log.Fatalf("cannot rename file")
+	}
 }
