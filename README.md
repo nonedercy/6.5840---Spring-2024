@@ -3,3 +3,4 @@
 
 当前进度：
 lab1：PASSED ALL TESTS
+lab2：PASS
