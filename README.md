@@ -3,6 +3,8 @@
 
 当前进度：
 
-lab1：PASSED ALL TESTS
+lab1:PASSED ALL TESTS
 
-lab2：PASS
+lab2:PASS
+
+lab3A:commit1
