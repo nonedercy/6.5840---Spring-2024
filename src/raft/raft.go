@@ -57,9 +57,9 @@ type ApplyMsg struct {
 }
 
 type entrie struct {
-	id   int
-	term int
-	v    interface{}
+	Id   int
+	Term int
+	V    interface{}
 }
 
 // A Go object implementing a single Raft peer.
@@ -172,7 +172,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
-	term, index := rf.log[len(rf.log)-1].term, rf.log[len(rf.log)-1].id
+	index, term := 0, 0
+	if len(rf.log) > 0 {
+		index, term = rf.log[len(rf.log)-1].Id, rf.log[len(rf.log)-1].Term
+	}
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && ((args.LastLogTerm > term) || (args.LastLogTerm == term && args.LastLogIndex >= index)) {
 		reply.VoteGranted = true
 	}
@@ -205,8 +208,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, voteDone chan bool) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	voteDone <- reply.VoteGranted
 	return ok
 }
 
@@ -225,8 +229,11 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.status = FOLLOWER
 	}
 	if args.Term == rf.currentTerm {
 		rf.patience = newPatience()
@@ -288,10 +295,8 @@ func (rf *Raft) ticker() {
 		case LEADER:
 			rf.heatBeat()
 		case FOLLOWER, CANDIDATE:
-			rf.patience -= 1
-			if rf.patience == 0 {
-				rf.status = CANDIDATE
-				rf.startElection()
+			if rf.patienceDown() {
+				go rf.startElection()
 			}
 		}
 		time.Sleep(time.Duration(100) * time.Millisecond)
@@ -302,23 +307,61 @@ func newPatience() int {
 	return 15 + rand.Intn(16)
 }
 
+func (rf *Raft) patienceDown() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.patience -= 1
+	if rf.patience == 0 {
+		rf.status = CANDIDATE
+		return true
+	}
+	return false
+}
+
 func (rf *Raft) heatBeat() {
 	for i := range rf.peers {
 		if i != rf.me {
-			rf.sendAppendEntries(i, &AppendEntriesArgs{}, &AppendEntriesReply{})
+			go rf.sendAppendEntries(i, &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}, &AppendEntriesReply{})
 		}
 	}
 }
 
 func (rf *Raft) startElection() {
+	rf.mu.Lock()
 	rf.currentTerm += 1
 	rf.patience = newPatience()
 	rf.votedFor = rf.me
+	index, term := 0, 0
+	if len(rf.log) > 0 {
+		index, term = rf.log[len(rf.log)-1].Id, rf.log[len(rf.log)-1].Term
+	}
+	args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: index, LastLogTerm: term}
+	rf.mu.Unlock()
+	voteDone := make(chan bool, len(rf.peers)-1)
 	for i := range rf.peers {
 		if i != rf.me {
-			rf.sendRequestVote(i, &RequestVoteArgs{}, &RequestVoteReply{})
+			go rf.sendRequestVote(i, &args, &RequestVoteReply{}, voteDone)
 		}
 	}
+	for done, votes := 1, 1; done < len(rf.peers); done += 1 {
+		voteGranted := <-voteDone
+		if voteGranted {
+			votes += 1
+			if votes*2 > len(rf.peers) {
+				rf.winElection(args.Term)
+			}
+		}
+	}
+}
+
+func (rf *Raft) winElection(term int) {
+	rf.mu.Lock()
+	if rf.status != CANDIDATE || term < rf.currentTerm {
+		return
+	}
+	rf.status = LEADER
+	rf.mu.Unlock()
+	rf.heatBeat()
 }
 
 // the service or tester wants to create a Raft server. the ports

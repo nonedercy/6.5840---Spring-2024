@@ -7,4 +7,4 @@ lab1:PASSED ALL TESTS
 
 lab2:PASS
 
-lab3A:commit1
+lab3A:PASS
