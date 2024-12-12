@@ -25,6 +25,7 @@ type Coordinator struct {
 	mapTasks    []*task
 	reduceTasks []*task
 	mu          sync.Mutex
+	done        chan bool
 }
 
 type task struct {
@@ -55,6 +56,7 @@ func (c *Coordinator) Task(args *TaskArgs, reply *TaskReply) error {
 			} else if c.t == TASK_REDUCE {
 				c.t = TASK_DONE
 				reply.T = TASK_DONE
+				c.done <- true
 				return nil
 			}
 		}
@@ -107,7 +109,7 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	// Your code here.
-	return c.t == TASK_DONE
+	return <-c.done
 }
 
 // create a Coordinator.
@@ -127,6 +129,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	for i := 0; i < nReduce; i += 1 {
 		c.reduceTasks = append(c.reduceTasks, &task{ch: make(chan struct{})})
 	}
+	c.done = make(chan bool)
 	c.server()
 	return &c
 }

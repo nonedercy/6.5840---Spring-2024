@@ -174,7 +174,7 @@ func doReduce(reducef func(string, []string) string, id int) {
 	})
 
 	if err != nil {
-		log.Fatalf("cannot read file")
+		log.Fatal("cannot read file", err)
 	}
 
 	sort.Sort(ByKey(kva))
