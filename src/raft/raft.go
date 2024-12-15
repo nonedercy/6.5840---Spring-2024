@@ -44,6 +44,9 @@ const (
 	LEADER
 )
 
+const tickInterval = 50 * time.Millisecond
+const basePatience = 15
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -64,7 +67,7 @@ type entrie struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -93,6 +96,8 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (3A).
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 	return rf.currentTerm, rf.status == LEADER
 }
 
@@ -169,9 +174,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
+		return
 	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.status = FOLLOWER
 		rf.votedFor = -1
 	}
 	index, term := 0, 0
@@ -181,6 +188,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && ((args.LastLogTerm > term) || (args.LastLogTerm == term && args.LastLogIndex >= index)) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
+		rf.patience = newPatience()
+		DPrintf("term %v, %v agree %v to win\n", rf.currentTerm, rf.me, args.CandidateId)
 	}
 }
 
@@ -212,6 +221,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, voteDone chan bool) bool {
+	DPrintf("%v sendRequestVote to %v start\n", rf.me, server)
+	defer DPrintf("%v sendRequestVote to %v end\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	voteDone <- reply.VoteGranted
 	return ok
@@ -234,16 +245,25 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.status = FOLLOWER
 	}
 	if args.Term == rf.currentTerm {
 		rf.patience = newPatience()
+		rf.status = FOLLOWER
 	}
+	reply.Term = rf.currentTerm
+	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	DPrintf("%v sendAppendEntries to %v start\n", rf.me, server)
+	defer DPrintf("%v sendAppendEntries to %v end\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -290,10 +310,11 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
+		rf.mu.Lock()
 		switch rf.status {
 		case LEADER:
 			rf.heatBeat()
@@ -302,17 +323,16 @@ func (rf *Raft) ticker() {
 				go rf.startElection()
 			}
 		}
-		time.Sleep(time.Duration(100) * time.Millisecond)
+		rf.mu.Unlock()
+		time.Sleep(tickInterval)
 	}
 }
 
 func newPatience() int {
-	return 15 + rand.Intn(16)
+	return basePatience + rand.Intn(basePatience+1)
 }
 
 func (rf *Raft) patienceDown() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.patience -= 1
 	if rf.patience == 0 {
 		rf.status = CANDIDATE
@@ -330,6 +350,8 @@ func (rf *Raft) heatBeat() {
 }
 
 func (rf *Raft) startElection() {
+	DPrintf("I'm %v, startElection\n", rf.me)
+	defer DPrintf("I'm %v, startElection end\n", rf.me)
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	rf.patience = newPatience()
@@ -359,12 +381,11 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) winElection(term int) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.status != CANDIDATE || term < rf.currentTerm {
 		return
 	}
 	rf.status = LEADER
-	rf.mu.Unlock()
-	rf.heatBeat()
 }
 
 // the service or tester wants to create a Raft server. the ports
