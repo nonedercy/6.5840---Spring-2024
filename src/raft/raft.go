@@ -258,7 +258,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.status = FOLLOWER
 	}
 	reply.Term = rf.currentTerm
-	reply.Success = true
+	p := -1
+	for p = range rf.log {
+		if rf.log[p].Id == args.PrevLogIndex && rf.log[p].Term == args.Term {
+			break
+		}
+	}
+	if p == -1 {
+		reply.Success = true
+		return
+	}
+	for i := range args.Entries {
+		p += 1
+		if p >= len(rf.log) {
+			rf.log = append(rf.log, args.Entries[i])
+			continue
+		}
+		if args.Entries[i].Id != rf.log[p].Id || args.Entries[i].Term != rf.log[p].Term {
+			rf.log[p] = args.Entries[i]
+			rf.log = rf.log[:p+1]
+		}
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommit
+		if rf.log[p].Id < rf.commitIndex {
+			rf.commitIndex = rf.log[p].Id
+		}
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -281,13 +307,21 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	lastIndex, lastTerm := 0, 0
+	if len(rf.log) > 0 {
+		lastIndex, lastTerm = rf.log[len(rf.log)-1].Id, rf.log[len(rf.log)-1].Term
+	}
+	newEntrie := entrie{lastIndex + 1, rf.currentTerm, command}
+	rf.log = append(rf.log, newEntrie)
+	for i := range rf.peers {
+		if i != rf.me {
+			go rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me, lastIndex, lastTerm, []entrie{newEntrie}, rf.commitIndex}, &AppendEntriesReply{})
+		}
+	}
+	return lastIndex + 1, rf.currentTerm, rf.status == LEADER
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
