@@ -169,18 +169,13 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
+	if term, ok := rf.validTerm(args.Term); !ok {
+		reply.Term = term
 		reply.VoteGranted = false
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.status = FOLLOWER
-		rf.votedFor = -1
-	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index, term := 0, 0
 	if len(rf.log) > 0 {
 		index, term = rf.log[len(rf.log)-1].Id, rf.log[len(rf.log)-1].Term
@@ -220,12 +215,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, voteDone chan bool) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, ch chan bool) {
 	DPrintf("%v sendRequestVote to %v start\n", rf.me, server)
 	defer DPrintf("%v sendRequestVote to %v end\n", rf.me, server)
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	voteDone <- reply.VoteGranted
-	return ok
+	reply := &RequestVoteReply{}
+	_ = rf.peers[server].Call("Raft.RequestVote", args, reply)
+	rf.validTerm(reply.Term)
+	ch <- reply.VoteGranted
 }
 
 type AppendEntriesArgs struct {
@@ -243,31 +239,26 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
+	if term, ok := rf.validTerm(args.Term); !ok {
+		reply.Term = term
 		reply.Success = false
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-	}
-	if args.Term == rf.currentTerm {
-		rf.patience = newPatience()
-		rf.status = FOLLOWER
-	}
-	reply.Term = rf.currentTerm
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	p := -1
-	for p = range rf.log {
-		if rf.log[p].Id == args.PrevLogIndex && rf.log[p].Term == args.Term {
-			break
+	if args.PrevLogIndex > 0 {
+		for p = range rf.log {
+			if rf.log[p].Id == args.PrevLogIndex && rf.log[p].Term == args.Term {
+				break
+			}
+		}
+		if p == -1 {
+			reply.Success = false
+			return
 		}
 	}
-	if p == -1 {
-		reply.Success = true
-		return
-	}
+
 	for i := range args.Entries {
 		p += 1
 		if p >= len(rf.log) {
@@ -284,6 +275,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.log[p].Id < rf.commitIndex {
 			rf.commitIndex = rf.log[p].Id
 		}
+		//rf.commit()
 	}
 }
 
@@ -291,6 +283,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	DPrintf("%v sendAppendEntries to %v start\n", rf.me, server)
 	defer DPrintf("%v sendAppendEntries to %v end\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	rf.validTerm(reply.Term)
 	return ok
 }
 
@@ -313,6 +306,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	lastIndex, lastTerm := 0, 0
 	if len(rf.log) > 0 {
 		lastIndex, lastTerm = rf.log[len(rf.log)-1].Id, rf.log[len(rf.log)-1].Term
+	}
+	if rf.status != LEADER {
+		return lastIndex + 1, rf.currentTerm, rf.status == LEADER
 	}
 	newEntrie := entrie{lastIndex + 1, rf.currentTerm, command}
 	rf.log = append(rf.log, newEntrie)
@@ -399,7 +395,7 @@ func (rf *Raft) startElection() {
 	voteDone := make(chan bool, len(rf.peers)-1)
 	for i := range rf.peers {
 		if i != rf.me {
-			go rf.sendRequestVote(i, &args, &RequestVoteReply{}, voteDone)
+			go rf.sendRequestVote(i, &args, voteDone)
 		}
 	}
 	for done, votes := 1, 1; done < len(rf.peers); done += 1 {
@@ -420,6 +416,24 @@ func (rf *Raft) winElection(term int) {
 		return
 	}
 	rf.status = LEADER
+}
+
+func (rf *Raft) validTerm(term int) (int, bool) {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	if term < rf.currentTerm {
+		return rf.currentTerm, false
+	}
+	if rf.currentTerm == term {
+		return rf.currentTerm, true
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.votedFor = -1
+	rf.currentTerm = term
+	rf.patience = newPatience()
+	rf.status = FOLLOWER
+	return rf.currentTerm, true
 }
 
 // the service or tester wants to create a Raft server. the ports
