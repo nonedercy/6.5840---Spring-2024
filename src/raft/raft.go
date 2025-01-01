@@ -279,12 +279,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	DPrintf("%v sendAppendEntries to %v start\n", rf.me, server)
 	defer DPrintf("%v sendAppendEntries to %v end\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	rf.validTerm(reply.Term)
-	return ok
+	if ok {
+		rf.nextIndex[server] -= 1
+		//resend by id-1
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -302,22 +305,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (3B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	lastIndex, lastTerm := 0, 0
+	lastIndex := 0
 	if len(rf.log) > 0 {
-		lastIndex, lastTerm = rf.log[len(rf.log)-1].Id, rf.log[len(rf.log)-1].Term
+		lastIndex = rf.log[len(rf.log)-1].Id
 	}
 	if rf.status != LEADER {
-		return lastIndex + 1, rf.currentTerm, rf.status == LEADER
+		term := rf.currentTerm
+		rf.mu.Unlock()
+		return lastIndex + 1, term, false
 	}
 	newEntrie := entrie{lastIndex + 1, rf.currentTerm, command}
 	rf.log = append(rf.log, newEntrie)
-	for i := range rf.peers {
-		if i != rf.me {
-			go rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me, lastIndex, lastTerm, []entrie{newEntrie}, rf.commitIndex}, &AppendEntriesReply{})
-		}
-	}
-	return lastIndex + 1, rf.currentTerm, rf.status == LEADER
+	rf.mu.Unlock()
+	rf.startApply()
+	return newEntrie.Id, newEntrie.Term, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -345,7 +346,9 @@ func (rf *Raft) ticker() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		switch rf.status {
+		status := rf.status
+		rf.mu.Unlock()
+		switch status {
 		case LEADER:
 			rf.heatBeat()
 		case FOLLOWER, CANDIDATE:
@@ -353,7 +356,6 @@ func (rf *Raft) ticker() {
 				go rf.startElection()
 			}
 		}
-		rf.mu.Unlock()
 		time.Sleep(tickInterval)
 	}
 }
@@ -416,23 +418,46 @@ func (rf *Raft) winElection(term int) {
 		return
 	}
 	rf.status = LEADER
+	rf.nextIndex = make([]int, len(rf.peers))
+	index := 0
+	if len(rf.log) > 0 {
+		index = rf.log[len(rf.log)-1].Id
+	}
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = index + 1
+	}
+	rf.matchIndex = make([]int, len(rf.peers))
+}
+
+func (rf *Raft) startApply() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index, term := 0, 0
+	if len(rf.log) > 1 {
+		index, term = rf.log[len(rf.log)-2].Id, rf.log[len(rf.log)-2].Term
+	}
+	args := AppendEntriesArgs{rf.currentTerm, rf.me, index, term, []entrie{rf.log[len(rf.log)-1]}, rf.commitIndex}
+	for i := range rf.peers {
+		if i != rf.me {
+			go rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
+		}
+	}
 }
 
 func (rf *Raft) validTerm(term int) (int, bool) {
-	rf.mu.RLock()
-	defer rf.mu.RUnlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if term < rf.currentTerm {
 		return rf.currentTerm, false
 	}
-	if rf.currentTerm == term {
-		return rf.currentTerm, true
+	if rf.currentTerm < term {
+		rf.votedFor = -1
+		rf.currentTerm = term
 	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.votedFor = -1
-	rf.currentTerm = term
 	rf.patience = newPatience()
 	rf.status = FOLLOWER
+	rf.nextIndex = nil
+	rf.matchIndex = nil
 	return rf.currentTerm, true
 }
 
